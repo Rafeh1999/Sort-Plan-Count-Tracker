@@ -1,0 +1,82 @@
+// Search for scan validation messages across two indexes for site ZLXH,
+// filtering by specific Events and Function name pattern
+(index=uds_equipment sourcetype="equipment.log") 
+OR (index=uds_application sourcetype="uds.core.log") 
+site="ZLXH" Function="validate*" Event IN ("ReceiveMessage","SendMessage") 
+
+// Convert raw event data into a JSON string for easier field access
+| tojson output_field=my_JSON_field 
+
+// Extract the sort area name from the file path using regex
+| rex field=source "Core\.(?<sort_area>\w+)" 
+
+// Use lookup to enrich sort area with its type (e.g. DH = Direct Handling)
+| lookup sort_area_type.csv area_name as sort_area output area_type as sort_area_type 
+
+// Filter only Direct Handling sort areas
+| search sort_area_type=DH 
+
+// Extract various fields from the JSON structure
+| eval loading_unit = coalesce(json_extract(Message,"Barcode"), json_extract(Message,"LoadingUnit.Barcode"))
+| eval handling_unit = json_extract(Message,"HandlingUnit.Barcode")
+| eval tracking_number = json_extract(Message,"TrackingNumber")
+| eval result = json_extract(Message,"Result")
+| eval sort_plan = json_extract(Message,"SplitName.SortPlanName")
+| eval type = json_extract(Message,"Type")
+| eval sort_area = json_extract(Message,"SplitName.AreaName")
+| eval origin = json_extract(Message,"Origin")
+| eval destination = json_extract(Message,"Destination")
+| eval scan_user_id = json_extract(Message,"ScanUserId")
+| eval device_id = json_extract(Message,"DeviceId")
+| eval scan_date_time = json_extract(Message,"ScanDateTime")
+| eval sort_rule = json_extract(Message,"SplitName.ShortName")
+| eval sort_rule_type = json_extract(Message,"SortedByRuleType")
+
+// Group events by Context and keep the most recent values for each field
+| stats latest(*) as * by Context
+
+// Select a subset of fields for display
+| table _time site Event Function Context loading_unit handling_unit tracking_number result sort_plan type sort_area origin destination scan_user_id device_id scan_date_time sort_rule sort_rule_type 
+
+// Further trim fields down to core identifiers and result
+| fields handling_unit, loading_unit, scan_date_time, Function, site, result 
+| table loading_unit, handling_unit, result 
+
+// Remove events where handling unit is missing or has an unrealistic length
+| where isnotnull(handling_unit) AND len(handling_unit) < 40 
+
+// Append additional LU-related data from "newconscreated" messages for historical context
+| append maxout=500000 
+    [ 
+    search 
+    (index=uds_equipment sourcetype="equipment.log") 
+    OR (index=uds_application sourcetype="uds.core.log") 
+    site="ZLXH" earliest=1751151600.000000 
+    Event IN ("ReceiveMessage","SendMessage") 
+    Function="newconscreated" 
+    | tojson output_field=my_JSON_field 
+    | rex field=source "Core\.(?<sort_area>\w+)" 
+    | lookup sort_area_type.csv area_name as sort_area output area_type as sort_area_type 
+    | search sort_area_type=DH 
+    | eval loading_unit = coalesce(json_extract(Message,"Barcode"), json_extract(Message,"LoadingUnit.Barcode")) 
+    | eval sort_plan = json_extract(Message,"SplitName.SortPlanName") 
+    | eval sort_rule = json_extract(Message,"SplitName.ShortName") 
+    | eval sort_rule_type = json_extract(Message,"SortedByRuleType") 
+    | table _time Function loading_unit sort_plan sort_rule 
+    | search loading_unit>0 
+    | table loading_unit, sort_plan, sort_rule 
+    ] 
+
+// Combine message data and LU metadata
+| stats 
+    values(handling_unit) as handling_unit, 
+    values(sort_plan) as sort_plan, 
+    values(sort_rule) as sort_rule, 
+    list(result) as result 
+  by loading_unit
+
+// Filter out rows where handling unit info is still missing
+| where isnotnull(handling_unit)
+
+// Final aggregation: count of LUs (aka packages) by sort plan, sort rule, and scan result
+| stats count(loading_unit) as handling_unit_count by sort_plan, sort_rule, result
